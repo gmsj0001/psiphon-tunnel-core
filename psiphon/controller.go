@@ -53,7 +53,6 @@ type Controller struct {
 	establishPendingConns       *Conns
 	untunneledPendingConns      *Conns
 	untunneledDialConfig        *DialConfig
-	splitTunnelClassifier       *SplitTunnelClassifier
 	signalFetchRemoteServerList chan struct{}
 }
 
@@ -76,6 +75,7 @@ func NewController(config *Config) (controller *Controller, err error) {
 		PendingConns:             untunneledPendingConns,
 		DeviceBinder:             config.DeviceBinder,
 		DnsServerGetter:          config.DnsServerGetter,
+		ConnectTimeout:			time.Second * 1,
 	}
 
 	controller = &Controller{
@@ -103,7 +103,7 @@ func NewController(config *Config) (controller *Controller, err error) {
 		signalFetchRemoteServerList: make(chan struct{}, 1),
 	}
 
-	controller.splitTunnelClassifier = NewSplitTunnelClassifier(config, controller)
+	NewSplitTunnelClassifier(config, controller)
 
 	return controller, nil
 }
@@ -169,7 +169,7 @@ func (controller *Controller) Run(shutdownBroadcast <-chan struct{}) {
 	controller.untunneledPendingConns.CloseAll()
 	controller.runWaitGroup.Wait()
 
-	controller.splitTunnelClassifier.Shutdown()
+	splitTunnelClassifier.Shutdown()
 
 	NoticeInfo("exiting controller")
 }
@@ -444,7 +444,7 @@ func (controller *Controller) registerTunnel(tunnel *Tunnel) bool {
 	// that assumption, the classifier will be re-Start()-ed here when
 	// the region has changed.
 	if len(controller.tunnels) == 1 {
-		controller.splitTunnelClassifier.Start(tunnel)
+		splitTunnelClassifier.Start(tunnel)
 	}
 
 	return true
@@ -565,7 +565,7 @@ func (controller *Controller) Dial(
 		// way this is currently implemented ensures that, e.g., DNS geo load balancing occurs
 		// relative to the outbound network.
 
-		if controller.splitTunnelClassifier.IsUntunneled(host) {
+		if splitTunnelClassifier.IsUntunneled(host) {
 			// !TODO! track downstreamConn and close it when the DialTCP conn closes, as with tunnel.Dial conns?
 			return DialTCP(remoteAddr, controller.untunneledDialConfig)
 		}

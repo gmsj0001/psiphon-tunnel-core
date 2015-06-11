@@ -40,6 +40,8 @@ type TCPConn struct {
 	interruptible interruptibleTCPSocket
 	readTimeout   time.Duration
 	writeTimeout  time.Duration
+	establishTime time.Time
+	hostname		string
 }
 
 // NewTCPDialer creates a TCPDialer.
@@ -54,10 +56,14 @@ func NewTCPDialer(config *DialConfig) Dialer {
 
 // TCPConn creates a new, connected TCPConn.
 func DialTCP(addr string, config *DialConfig) (conn *TCPConn, err error) {
+	host, _, _ := net.SplitHostPort(addr)
 	conn, err = interruptibleTCPDial(addr, config)
 	if err != nil {
+		splitTunnelClassifier.AddTunneled(host, time.Second * 300)
 		return nil, ContextError(err)
 	}
+	conn.hostname = host
+	conn.establishTime = time.Now()
 	return conn, nil
 }
 
@@ -104,6 +110,9 @@ func (conn *TCPConn) Read(buffer []byte) (n int, err error) {
 	}
 	n, err = conn.Conn.Read(buffer)
 	if err != nil {
+		if time.Now().After(conn.establishTime.Add(time.Second)) {
+			splitTunnelClassifier.AddTunneled(conn.hostname, time.Second * 90)
+		}
 		conn.Close()
 	}
 	return

@@ -28,7 +28,7 @@ import (
 	"runtime/pprof"
 	"sync"
 
-	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon"
+	"github.com/gmsj0001/psiphon-tunnel-core/psiphon"
 )
 
 func main() {
