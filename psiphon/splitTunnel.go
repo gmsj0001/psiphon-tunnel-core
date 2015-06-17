@@ -75,13 +75,10 @@ type SplitTunnelClassifier struct {
 	dnsTunneler              Tunneler
 	fetchRoutesWaitGroup     *sync.WaitGroup
 	isRoutesSet              bool
-	cache                    map[string]*classification
+	cache                    map[string]time.Time
 	routes                   networkList
-}
-
-type classification struct {
-	isUntunneled bool
-	expiry       time.Time
+	posionCache              map[string]bool
+	dnsCache                 map[string]net.IP
 }
 
 var splitTunnelClassifier *SplitTunnelClassifier
@@ -94,7 +91,9 @@ func NewSplitTunnelClassifier(config *Config, tunneler Tunneler) {
 		dnsTunneler:              tunneler,
 		fetchRoutesWaitGroup:     new(sync.WaitGroup),
 		isRoutesSet:              false,
-		cache:                    make(map[string]*classification),
+		cache:                    make(map[string]time.Time),
+		posionCache:              make(map[string]bool),
+		dnsCache:                 make(map[string]net.IP),
 	}
 }
 
@@ -146,63 +145,88 @@ func (classifier *SplitTunnelClassifier) Shutdown() {
 	}
 }
 
+
+func (classifier *SplitTunnelClassifier) IsDnsPosioned(host string) bool {
+	isPosioned, ok := classifier.posionCache[host]
+	if ok {
+		return isPosioned
+	}
+	conn, _ := net.Dial("udp", "1.0.0.0:53")
+	conn.SetReadDeadline(time.Now().Add(time.Millisecond * 100))
+	for i := 0; i < 3; i++ {
+		_, _, err := ResolveIP(host, conn)
+		if err == nil {
+			classifier.posionCache[host] = true
+			NoticeInfo("dns posioned: %s", host)
+			return true
+		}		
+	}
+	classifier.posionCache[host] = false
+	return false
+}
+
+
 // IsUntunneled takes a destination hostname or IP address and determines
 // if it should be accessed through a tunnel. When a hostname is presented, it
 // is first resolved to an IP address which can be matched against the routes data.
 // Multiple goroutines may invoke RequiresTunnel simultaneously. Multi-reader
 // locks are used in the implementation to enable concurrent access, with no locks
 // held during network access.
-func (classifier *SplitTunnelClassifier) IsUntunneled(targetAddress string) bool {
+func (classifier *SplitTunnelClassifier) IsUntunneled(targetAddress string) (ok bool, newaddr string)  {
 
 	if !classifier.hasRoutes() {
-		return true
+		return true, ""
 	}
+	
+	host, port, _ := net.SplitHostPort(targetAddress)
+	
+	//local resolv
+	addrs, err := net.LookupIP(host)
+	if err != nil {
+		return true, ""
+	}
+	
+	if classifier.ipAddressInRoutes(addrs[0]) {
+		return true, ""
+	}
+	
+	ip := addrs[0].String()
+	
+	if classifier.IsDnsPosioned(host) {
+		if port == "80" {
+			return false, ""
+		}
+		addr, err := classifier.tunneledLookupIP(host)
+		if err != nil {
+			return true, ""
+		}
+		ip = addr.String()
+	}
+	ipport := net.JoinHostPort(ip, port)
 
 	classifier.mutex.RLock()
-	cachedClassification, ok := classifier.cache[targetAddress]
+	expiry, ok := classifier.cache[ipport]
 	classifier.mutex.RUnlock()
-	if ok && cachedClassification.expiry.After(time.Now()) {
-		return cachedClassification.isUntunneled
+	if ok && expiry.After(time.Now()) {
+		return false, ""
 	}
 
-	ipAddr, isPosion, err := tunneledLookupIP(targetAddress)
-	if err != nil {
-		NoticeAlert("failed to resolve address for split tunnel classification: %s", err)
-		return false
-	}
-	expiry := time.Now()
-	if classifier.ipAddressInRoutes(ipAddr) {
-		expiry = expiry.Add(time.Hour)
-	} else {
-		expiry = expiry.Add(time.Minute)
-	}
-
-
-	isUntunneled := true
-	if isPosion == true {
-		isUntunneled = false
-	}
-
-	// TODO: garbage collect expired items from cache?
-
-	classifier.mutex.Lock()
-	classifier.cache[targetAddress] = &classification{isUntunneled, expiry}
-	classifier.mutex.Unlock()
-
-	if isUntunneled {
-		NoticeUntunneled(targetAddress)
-	}
-
-	return isUntunneled
+	return true, ipport
 }
 
-func (classifier *SplitTunnelClassifier) AddTunneled(targetAddress string, ttl time.Duration) {
-	ipAddr, _, err := tunneledLookupIP(targetAddress)
-	if err != nil || classifier.ipAddressInRoutes(ipAddr) {
+func (classifier *SplitTunnelClassifier) AddTunneled(ipport string, ttl time.Duration) {
+	ip, _, _ := net.SplitHostPort(ipport)
+
+	ipAddr := net.ParseIP(ip)
+	if (ipAddr == nil) {
 		return
 	}
+	if classifier.ipAddressInRoutes(ipAddr) {
+		return
+	}
+	NoticeInfo("add tunnel: %s", ipport)
 	classifier.mutex.Lock()
-	classifier.cache[targetAddress] = &classification{false, time.Now().Add(ttl)}
+	classifier.cache[ipport] = time.Now().Add(ttl)
 	classifier.mutex.Unlock()
 }
 
@@ -483,51 +507,37 @@ func (list networkList) ContainsIpAddress(addr net.IP) bool {
 
 // tunneledLookupIP resolves a split tunnel candidate hostname with a tunneled
 // DNS request.
-func tunneledLookupIP(host string) (addr net.IP, isPosion bool, err error) {
+func (classifier *SplitTunnelClassifier) tunneledLookupIP(host string) (addr net.IP, err error) {
 
 	ipAddr := net.ParseIP(host)
 	if ipAddr != nil {
 		// maxDuration from golang.org/src/time/time.go
-		return ipAddr, false, nil
-	}
-	ipAddrs, _ := net.LookupIP(host)
-	if len(ipAddrs) > 0 && splitTunnelClassifier.ipAddressInRoutes(ipAddrs[0]) {
-		return ipAddrs[0], false, nil
+		return ipAddr, nil
 	}
 	
-	conn, err := net.Dial("udp", "1.0.0.0:53")
-	
-	conn.SetReadDeadline(time.Now().Add(time.Millisecond * 200))
-	_, _, err = ResolveIP(host, conn)
-	if (err != nil) {
-		if len(ipAddrs) < 1 {
-			return nil, false, ContextError(errors.New("no IP address"))
-		}
-		return ipAddrs[0], false, nil
-	}
-	// dnsServerAddress must be an IP address
-	ipAddr = net.ParseIP(splitTunnelClassifier.dnsServerAddress)
-	if ipAddr == nil {
-		return nil, true, ContextError(errors.New("invalid IP address"))
+	ip, ok := classifier.dnsCache[host]
+	if ok {
+		return ip, nil
 	}
 
 	// Dial's alwaysTunnel is set to true to ensure this connection
 	// is tunneled (also ensures this code path isn't circular).
 	// Assumes tunnel dialer conn configures timeouts and interruptibility.
 
-	conn, err = splitTunnelClassifier.dnsTunneler.Dial(fmt.Sprintf(
-		"%s:%d", splitTunnelClassifier.dnsServerAddress, DNS_PORT), true, nil)
+	conn, err := splitTunnelClassifier.dnsTunneler.Dial("8.8.4.4:53", true, nil)
 	if err != nil {
-		return nil, true, ContextError(err)
+		return nil, ContextError(err)
 	}
 
-	ipAddrs, _, err = ResolveIP(host, conn)
+	ipAddrs, _, err := ResolveIP(host, conn)
 	if err != nil {
-		return nil, true, ContextError(err)
+		return nil, ContextError(err)
 	}
 	if len(ipAddrs) < 1 {
-		return nil, true, ContextError(errors.New("no IP address"))
+		return nil, ContextError(errors.New("no IP address"))
 	}
+	
+	classifier.dnsCache[host] = ipAddrs[0]
 
-	return ipAddrs[0], true, nil
+	return ipAddrs[0], nil
 }

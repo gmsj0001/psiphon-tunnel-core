@@ -41,7 +41,6 @@ type TCPConn struct {
 	readTimeout   time.Duration
 	writeTimeout  time.Duration
 	establishTime time.Time
-	hostname		string
 }
 
 // NewTCPDialer creates a TCPDialer.
@@ -56,13 +55,12 @@ func NewTCPDialer(config *DialConfig) Dialer {
 
 // TCPConn creates a new, connected TCPConn.
 func DialTCP(addr string, config *DialConfig) (conn *TCPConn, err error) {
-	host, _, _ := net.SplitHostPort(addr)
+	config.ConnectTimeout = time.Second * 2
 	conn, err = interruptibleTCPDial(addr, config)
 	if err != nil {
-		splitTunnelClassifier.AddTunneled(host, time.Second * 300)
+		splitTunnelClassifier.AddTunneled(addr, time.Hour)
 		return nil, ContextError(err)
 	}
-	conn.hostname = host
 	conn.establishTime = time.Now()
 	return conn, nil
 }
@@ -110,8 +108,12 @@ func (conn *TCPConn) Read(buffer []byte) (n int, err error) {
 	}
 	n, err = conn.Conn.Read(buffer)
 	if err != nil {
-		if time.Now().After(conn.establishTime.Add(time.Second)) {
-			splitTunnelClassifier.AddTunneled(conn.hostname, time.Second * 90)
+		ipport := conn.RemoteAddr().String()
+		NoticeInfo("connection reset: %s", ipport)
+		_, port, _ := net.SplitHostPort(ipport)
+
+		if port == "80" && time.Now().Before(conn.establishTime.Add(time.Second)) {
+			splitTunnelClassifier.AddTunneled(ipport, time.Second * 90)
 		}
 		conn.Close()
 	}

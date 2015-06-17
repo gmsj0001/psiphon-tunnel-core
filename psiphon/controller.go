@@ -75,7 +75,6 @@ func NewController(config *Config) (controller *Controller, err error) {
 		PendingConns:             untunneledPendingConns,
 		DeviceBinder:             config.DeviceBinder,
 		DnsServerGetter:          config.DnsServerGetter,
-		ConnectTimeout:			time.Second * 1,
 	}
 
 	controller = &Controller{
@@ -554,19 +553,17 @@ func (controller *Controller) Dial(
 	// address is classified as untunneled, dial directly.
 	if !alwaysTunnel && controller.config.SplitTunnelDnsServer != "" {
 
-		host, _, err := net.SplitHostPort(remoteAddr)
-		if err != nil {
-			return nil, ContextError(err)
-		}
-
 		// Note: a possible optimization, when split tunnel is active and IsUntunneled performs
 		// a DNS resolution in order to make its classification, is to reuse that IP address in
 		// the following Dials so they do not need to make their own resolutions. However, the
 		// way this is currently implemented ensures that, e.g., DNS geo load balancing occurs
 		// relative to the outbound network.
-
-		if splitTunnelClassifier.IsUntunneled(host) {
-			// !TODO! track downstreamConn and close it when the DialTCP conn closes, as with tunnel.Dial conns?
+		isUntunneled, newAddr := splitTunnelClassifier.IsUntunneled(remoteAddr)
+		
+		if isUntunneled {
+			if newAddr != "" {
+				remoteAddr = newAddr
+			}
 			return DialTCP(remoteAddr, controller.untunneledDialConfig)
 		}
 	}
